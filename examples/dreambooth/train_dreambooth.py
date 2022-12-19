@@ -1,13 +1,13 @@
 import argparse
+import contextlib
 import hashlib
 import itertools
-import random
-import json
 import math
 import os
-from contextlib import nullcontext
+import warnings
 from pathlib import Path
 from typing import Optional
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_depth2img import StableDiffusionDepth2ImgPipeline
 
 import torch
 import torch.nn.functional as F
@@ -17,19 +17,40 @@ from torch.utils.data import Dataset
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
+from diffusers.utils import check_min_version
+from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import AutoTokenizer, PretrainedConfig
 
-
-torch.backends.cudnn.benchmark = True
-
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__)
+
+
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=revision,
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "RobertaSeriesModelWithTransformation":
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+
+        return RobertaSeriesModelWithTransformation
+    else:
+        raise ValueError(f"{model_class} is not supported.")
 
 
 def parse_args(input_args=None):
@@ -42,10 +63,11 @@ def parse_args(input_args=None):
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--pretrained_vae_name_or_path",
+        "--pretrained_txt2img_model_name_or_path",
         type=str,
         default=None,
-        help="Path to pretrained vae or vae identifier from huggingface.co/models.",
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models. This model will be used to generate images from text, without depth conditioning, for generating sample images.",
     )
     parser.add_argument(
         "--revision",
@@ -64,18 +86,21 @@ def parse_args(input_args=None):
         "--instance_data_dir",
         type=str,
         default=None,
+        required=True,
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
         "--class_data_dir",
         type=str,
         default=None,
+        required=False,
         help="A folder containing the training data of class images.",
     )
     parser.add_argument(
         "--instance_prompt",
         type=str,
         default=None,
+        required=True,
         help="The prompt with identifier specifying the instance",
     )
     parser.add_argument(
@@ -83,42 +108,6 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help="The prompt to specify images in the same class as provided instance images.",
-    )
-    parser.add_argument(
-        "--save_sample_prompt",
-        type=str,
-        default=None,
-        help="The prompt used to generate sample outputs to save.",
-    )
-    parser.add_argument(
-        "--save_sample_negative_prompt",
-        type=str,
-        default=None,
-        help="The negative prompt used to generate sample outputs to save.",
-    )
-    parser.add_argument(
-        "--n_save_sample",
-        type=int,
-        default=4,
-        help="The number of samples to save.",
-    )
-    parser.add_argument(
-        "--save_guidance_scale",
-        type=float,
-        default=7.5,
-        help="CFG for save sample.",
-    )
-    parser.add_argument(
-        "--save_infer_steps",
-        type=int,
-        default=50,
-        help="The number of inference steps for save sample.",
-    )
-    parser.add_argument(
-        "--pad_tokens",
-        default=False,
-        action="store_true",
-        help="Flag to pad tokens to length 77.",
     )
     parser.add_argument(
         "--with_prior_preservation",
@@ -132,8 +121,8 @@ def parse_args(input_args=None):
         type=int,
         default=100,
         help=(
-            "Minimal class images for prior preservation loss. If not have enough images, additional images will be"
-            " sampled with class_prompt."
+            "Minimal class images for prior preservation loss. If there are not enough images already present in"
+            " class_data_dir, additional images will be sampled with class_prompt."
         ),
     )
     parser.add_argument(
@@ -168,6 +157,24 @@ def parse_args(input_args=None):
         type=int,
         default=None,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -229,9 +236,6 @@ def parse_args(input_args=None):
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
     )
-    parser.add_argument("--log_interval", type=int, default=10, help="Log every N steps.")
-    parser.add_argument("--save_interval", type=int, default=10_000, help="Save weights every N steps.")
-    parser.add_argument("--save_min_steps", type=int, default=0, help="Start saving weights after N steps.")
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -243,15 +247,7 @@ def parse_args(input_args=None):
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
     )
-    parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
-    parser.add_argument("--hflip", action="store_true", help="Apply horizontal flip data augmentation.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument(
-        "--concepts_list",
-        type=str,
-        default=None,
-        help="Path to json containing multiple concepts, will overwrite parameters like instance_prompt, class_prompt, etc.",
-    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -262,7 +258,23 @@ def parse_args(input_args=None):
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    if args.with_prior_preservation:
+        if args.class_data_dir is None:
+            raise ValueError("You must specify a data directory for class images.")
+        if args.class_prompt is None:
+            raise ValueError("You must specify prompt for class images.")
+    else:
+        # logger is not available yet
+        if args.class_data_dir is not None:
+            warnings.warn("You need not use --class_data_dir without --with_prior_preservation.")
+        if args.class_prompt is not None:
+            warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
+
     return args
+
+
+def get_depth_image_path(normal_image_path):
+    return normal_image_path.parent / f"{normal_image_path.stem}_depth.png"
 
 
 class DreamBoothDataset(Dataset):
@@ -272,45 +284,55 @@ class DreamBoothDataset(Dataset):
     """
 
     def __init__(
-        self,
-        concepts_list,
-        tokenizer,
-        with_prior_preservation=True,
-        size=512,
-        center_crop=False,
-        num_class_images=None,
-        pad_tokens=False,
-        hflip=False
+            self,
+            instance_data_root,
+            instance_prompt,
+            tokenizer,
+            vae_scale_factor,
+            class_data_root=None,
+            class_prompt=None,
+            size=512,
+            center_crop=False
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
-        self.with_prior_preservation = with_prior_preservation
-        self.pad_tokens = pad_tokens
+        self.vae_scale_factor = vae_scale_factor
 
-        self.instance_images_path = []
-        self.class_images_path = []
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError("Instance images root doesn't exists.")
 
-        for concept in concepts_list:
-            inst_img_path = [(x, concept["instance_prompt"]) for x in Path(concept["instance_data_dir"]).iterdir() if x.is_file()]
-            self.instance_images_path.extend(inst_img_path)
-
-            if with_prior_preservation:
-                class_img_path = [(x, concept["class_prompt"]) for x in Path(concept["class_data_dir"]).iterdir() if x.is_file()]
-                self.class_images_path.extend(class_img_path[:num_class_images])
-
-        random.shuffle(self.instance_images_path)
+        self.instance_images_path = list(
+            filter(lambda path: str(path).find("_depth.") == -1, self.instance_data_root.iterdir()))
         self.num_instance_images = len(self.instance_images_path)
-        self.num_class_images = len(self.class_images_path)
-        self._length = max(self.num_class_images, self.num_instance_images)
+        self.instance_prompt = instance_prompt
+        self._length = self.num_instance_images
+
+        if class_data_root is not None:
+            self.class_data_root = Path(class_data_root)
+            self.class_data_root.mkdir(parents=True, exist_ok=True)
+            self.class_images_path = list(
+                filter(lambda path: str(path).find("_depth.") == -1, self.class_data_root.iterdir()))
+            self.num_class_images = len(self.class_images_path)
+            self._length = max(self.num_class_images, self.num_instance_images)
+            self.class_prompt = class_prompt
+        else:
+            self.class_data_root = None
 
         self.image_transforms = transforms.Compose(
             [
-                transforms.RandomHorizontalFlip(0.5 * hflip),
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+        self.depth_image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size // self.vae_scale_factor, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.ToTensor()
             ]
         )
 
@@ -319,32 +341,68 @@ class DreamBoothDataset(Dataset):
 
     def __getitem__(self, index):
         example = {}
-        instance_path, instance_prompt = self.instance_images_path[index % self.num_instance_images]
-        instance_image = Image.open(instance_path)
+        instance_image_path = self.instance_images_path[index % self.num_instance_images]
+        instance_depth_image_path = get_depth_image_path(instance_image_path)
+        instance_image = Image.open(instance_image_path)
+        instance_depth_image = Image.open(instance_depth_image_path)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_depth_images"] = self.depth_image_transforms(instance_depth_image)
         example["instance_prompt_ids"] = self.tokenizer(
-            instance_prompt,
-            padding="max_length" if self.pad_tokens else "do_not_pad",
+            self.instance_prompt,
             truncation=True,
+            padding="max_length",
             max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
         ).input_ids
 
-        if self.with_prior_preservation:
-            class_path, class_prompt = self.class_images_path[index % self.num_class_images]
-            class_image = Image.open(class_path)
+        if self.class_data_root:
+            class_image_path = self.class_images_path[index % self.num_class_images]
+            class_depth_image_path = get_depth_image_path(class_image_path)
+            class_image = Image.open(class_image_path)
+            class_depth_image = Image.open(class_depth_image_path)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
+            example["class_depth_images"] = self.depth_image_transforms(class_depth_image)
             example["class_prompt_ids"] = self.tokenizer(
-                class_prompt,
-                padding="max_length" if self.pad_tokens else "do_not_pad",
+                self.class_prompt,
                 truncation=True,
+                padding="max_length",
                 max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
             ).input_ids
 
         return example
+
+
+def collate_fn(examples, with_prior_preservation=False):
+    input_ids = [example["instance_prompt_ids"] for example in examples]
+    pixel_values = [example["instance_images"] for example in examples]
+    depth_values = [example["instance_depth_images"] for example in examples]
+
+    # Concat class and instance examples for prior preservation.
+    # We do this to avoid doing two forward passes.
+    if with_prior_preservation:
+        input_ids += [example["class_prompt_ids"] for example in examples]
+        pixel_values += [example["class_images"] for example in examples]
+        depth_values += [example["class_depth_images"] for example in examples]
+
+    pixel_values = torch.stack(pixel_values)
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+    depth_values = torch.stack(depth_values)
+    depth_values = depth_values.to(memory_format=torch.contiguous_format).float()
+
+    input_ids = torch.cat(input_ids, dim=0)
+
+    batch = {
+        "input_ids": input_ids,
+        "pixel_values": pixel_values,
+        "depth_values": depth_values
+    }
+    return batch
 
 
 class PromptDataset(Dataset):
@@ -353,6 +411,7 @@ class PromptDataset(Dataset):
     def __init__(self, prompt, num_samples):
         self.prompt = prompt
         self.num_samples = num_samples
+        print(f'Creating prompt dataset with prompt={prompt} and num_samples={num_samples}')
 
     def __len__(self):
         return self.num_samples
@@ -362,32 +421,6 @@ class PromptDataset(Dataset):
         example["prompt"] = self.prompt
         example["index"] = index
         return example
-
-
-class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache):
-        self.latents_cache = latents_cache
-        self.text_encoder_cache = text_encoder_cache
-
-    def __len__(self):
-        return len(self.latents_cache)
-
-    def __getitem__(self, index):
-        return self.latents_cache[index], self.text_encoder_cache[index]
-
-
-class AverageMeter:
-    def __init__(self, name=None):
-        self.name = name
-        self.reset()
-
-    def reset(self):
-        self.sum = self.count = self.avg = 0
-
-    def update(self, val, n=1):
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
 
 
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
@@ -400,8 +433,39 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
+def create_depth_images(paths, pretrained_model_name_or_path, accelerator, unet, text_encoder):
+    pipeline = DiffusionPipeline.from_pretrained(
+        pretrained_model_name_or_path,
+        unet=accelerator.unwrap_model(unet),
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        revision=args.revision,
+    )
+    pipeline.to("cuda")
+    for path in paths:
+        print(f"For each image in {path}, creating a depth image.")
+        path_iterator = Path(path).iterdir()
+        non_depth_image_files = list(filter(lambda path: str(path).find("_depth.") == -1, path_iterator))
+        for image_path in tqdm(non_depth_image_files):
+            depth_path = get_depth_image_path(image_path)
+            if depth_path.exists():
+                continue
+            image_instance = Image.open(image_path)
+            if not image_instance.mode == "RGB":
+                image_instance = image_instance.convert("RGB")
+            image_instance = pipeline.feature_extractor(image_instance, return_tensors="pt").pixel_values
+            image_instance = image_instance.to("cuda")
+            depth_map = pipeline.depth_estimator(image_instance).predicted_depth
+            depth_min = torch.amin(depth_map, dim=[0, 1, 2], keepdim=True)
+            depth_max = torch.amax(depth_map, dim=[0, 1, 2], keepdim=True)
+            depth_map = 2.0 * (depth_map - depth_min) / (depth_max - depth_min) - 1.0
+            depth_map = depth_map[0, :, :]
+            depth_map_image = transforms.ToPILImage()(depth_map)
+            depth_map_image.save(depth_path)
+    return 2 ** (len(pipeline.vae.config.block_out_channels) - 1)
+
+
 def main(args):
-    logging_dir = Path(args.output_dir, "0", args.logging_dir)
+    logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -422,82 +486,82 @@ def main(args):
     if args.seed is not None:
         set_seed(args.seed)
 
-    if args.concepts_list is None:
-        args.concepts_list = [
-            {
-                "instance_prompt": args.instance_prompt,
-                "class_prompt": args.class_prompt,
-                "instance_data_dir": args.instance_data_dir,
-                "class_data_dir": args.class_data_dir
-            }
-        ]
-    else:
-        with open(args.concepts_list, "r") as f:
-            args.concepts_list = json.load(f)
-
     if args.with_prior_preservation:
-        pipeline = None
-        for concept in args.concepts_list:
-            class_images_dir = Path(concept["class_data_dir"])
-            class_images_dir.mkdir(parents=True, exist_ok=True)
-            cur_class_images = len(list(class_images_dir.iterdir()))
+        class_images_dir = Path(args.class_data_dir)
+        if not class_images_dir.exists():
+            class_images_dir.mkdir(parents=True)
+        cur_class_images = len(list(class_images_dir.iterdir()))
 
-            if cur_class_images < args.num_class_images:
-                torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-                if pipeline is None:
-                    pipeline = StableDiffusionPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        vae=AutoencoderKL.from_pretrained(
-                            args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
-                            subfolder=None if args.pretrained_vae_name_or_path else "vae",
-                            revision=None if args.pretrained_vae_name_or_path else args.revision,
-                            torch_dtype=torch_dtype
-                        ),
-                        torch_dtype=torch_dtype,
-                        safety_checker=None,
-                        revision=args.revision
-                    )
-                    pipeline.set_progress_bar_config(disable=True)
-                    pipeline.to(accelerator.device)
+        if cur_class_images < args.num_class_images:
+            torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+            pipeline = DiffusionPipeline.from_pretrained(
+                args.pretrained_txt2img_model_name_or_path,
+                torch_dtype=torch_dtype,
+                safety_checker=None,
+                revision=args.revision,
+            )
+            pipeline.set_progress_bar_config(disable=True)
 
-                num_new_images = args.num_class_images - cur_class_images
-                logger.info(f"Number of class images to sample: {num_new_images}.")
+            num_new_images = args.num_class_images - cur_class_images
+            logger.info(f"Number of class images to sample: {num_new_images}.")
 
-                sample_dataset = PromptDataset(concept["class_prompt"], num_new_images)
-                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
+            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
+            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
 
-                sample_dataloader = accelerator.prepare(sample_dataloader)
+            sample_dataloader = accelerator.prepare(sample_dataloader)
+            pipeline.to(accelerator.device)
 
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for example in tqdm(
-                        sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-                    ):
-                        images = pipeline(example["prompt"]).images
+            for example in tqdm(
+                    sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+            ):
+                images = pipeline(example["prompt"]).images
 
-                        for i, image in enumerate(images):
-                            hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                            image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                            image.save(image_filename)
+                for i, image in enumerate(images):
+                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                    image.save(image_filename)
 
-        del pipeline
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            del pipeline
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.push_to_hub:
+            if args.hub_model_id is None:
+                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
+            else:
+                repo_name = args.hub_model_id
+            repo = Repository(args.output_dir, clone_from=repo_name)
+
+            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
+                if "step_*" not in gitignore:
+                    gitignore.write("step_*\n")
+                if "epoch_*" not in gitignore:
+                    gitignore.write("epoch_*\n")
+        elif args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
 
     # Load the tokenizer
     if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_name,
             revision=args.revision,
+            use_fast=False,
         )
     elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="tokenizer",
             revision=args.revision,
+            use_fast=False,
         )
 
+    # import correct text encoder class
+    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+
     # Load models and create wrapper for stable diffusion
-    text_encoder = CLIPTextModel.from_pretrained(
+    text_encoder = text_encoder_cls.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=args.revision,
@@ -511,8 +575,16 @@ def main(args):
         args.pretrained_model_name_or_path,
         subfolder="unet",
         revision=args.revision,
-        torch_dtype=torch.float32
     )
+
+    if is_xformers_available():
+        try:
+            unet.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            logger.warning(
+                "Could not enable memory efficient attention. Make sure xformers is installed"
+                f" correctly and a GPU is available: {e}"
+            )
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
@@ -525,7 +597,7 @@ def main(args):
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -552,81 +624,28 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
+    vae_scale_factor = create_depth_images([args.instance_data_dir, args.class_data_dir],
+                                           args.pretrained_model_name_or_path, accelerator, unet, text_encoder)
     train_dataset = DreamBoothDataset(
-        concepts_list=args.concepts_list,
+        instance_data_root=args.instance_data_dir,
+        instance_prompt=args.instance_prompt,
         tokenizer=tokenizer,
-        with_prior_preservation=args.with_prior_preservation,
+        vae_scale_factor=vae_scale_factor,
+        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+        class_prompt=args.class_prompt,
         size=args.resolution,
         center_crop=args.center_crop,
-        num_class_images=args.num_class_images,
-        pad_tokens=args.pad_tokens,
-        hflip=args.hflip
     )
-
-    def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        input_ids = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding=True,
-            return_tensors="pt",
-        ).input_ids
-
-        batch = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-        }
-        return batch
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        num_workers=1,
     )
-
-    weight_dtype = torch.float32
-    if args.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Move text_encode and vae to gpu.
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    vae.to(accelerator.device, dtype=weight_dtype)
-    if not args.train_text_encoder:
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
-
-    if not args.not_cache_latents:
-        latents_cache = []
-        text_encoder_cache = []
-        for batch in tqdm(train_dataloader, desc="Caching latents"):
-            with torch.no_grad():
-                batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
-                batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
-                latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
-                if args.train_text_encoder:
-                    text_encoder_cache.append(batch["input_ids"])
-                else:
-                    text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache)
-        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
-
-        del vae
-        if not args.train_text_encoder:
-            del text_encoder
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -650,6 +669,20 @@ def main(args):
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
         )
+    accelerator.register_for_checkpointing(lr_scheduler)
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move text_encode and vae to gpu.
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    vae.to(accelerator.device, dtype=weight_dtype)
+    if not args.train_text_encoder:
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -661,7 +694,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("dreambooth")
+        accelerator.init_trackers("dreambooth", config=vars(args))
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -674,74 +707,45 @@ def main(args):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
 
-    def save_weights(step):
-        # Create the pipeline using using the trained modules and save it.
-        if accelerator.is_main_process:
-            if args.train_text_encoder:
-                text_enc_model = accelerator.unwrap_model(text_encoder)
-            else:
-                text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
-            scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
-            pipeline = StableDiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                unet=accelerator.unwrap_model(unet),
-                text_encoder=text_enc_model,
-                vae=AutoencoderKL.from_pretrained(
-                    args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
-                    subfolder=None if args.pretrained_vae_name_or_path else "vae",
-                    revision=None if args.pretrained_vae_name_or_path else args.revision,
-                ),
-                safety_checker=None,
-                scheduler=scheduler,
-                torch_dtype=torch.float16,
-                revision=args.revision,
-            )
-            save_dir = os.path.join(args.output_dir, f"{step}")
-            pipeline.save_pretrained(save_dir)
-            with open(os.path.join(save_dir, "args.json"), "w") as f:
-                json.dump(args.__dict__, f, indent=2)
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the mos recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1]
+        accelerator.print(f"Resuming from checkpoint {path}")
+        accelerator.load_state(os.path.join(args.output_dir, path))
+        global_step = int(path.split("-")[1])
 
-            if args.save_sample_prompt is not None:
-                pipeline = pipeline.to(accelerator.device)
-                g_cuda = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-                pipeline.set_progress_bar_config(disable=True)
-                sample_dir = os.path.join(save_dir, "samples")
-                os.makedirs(sample_dir, exist_ok=True)
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for i in tqdm(range(args.n_save_sample), desc="Generating samples"):
-                        images = pipeline(
-                            args.save_sample_prompt,
-                            negative_prompt=args.save_sample_negative_prompt,
-                            guidance_scale=args.save_guidance_scale,
-                            num_inference_steps=args.save_infer_steps,
-                            generator=g_cuda
-                        ).images
-                        images[0].save(os.path.join(sample_dir, f"{i}.png"))
-                del pipeline
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            print(f"[*] Weights saved at {save_dir}")
+        resume_global_step = global_step * args.gradient_accumulation_steps
+        first_epoch = resume_global_step // num_update_steps_per_epoch
+        resume_step = resume_global_step % num_update_steps_per_epoch
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-    global_step = 0
-    loss_avg = AverageMeter()
-    text_enc_context = nullcontext() if args.train_text_encoder else torch.no_grad()
-    for epoch in range(args.num_train_epochs):
+
+    for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         if args.train_text_encoder:
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
+            # Skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % args.gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                continue
+
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                with torch.no_grad():
-                    if not args.not_cache_latents:
-                        latent_dist = batch[0][0]
-                    else:
-                        latent_dist = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist
-                    latents = latent_dist.sample() * 0.18215
+                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = latents * 0.18215
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -754,65 +758,83 @@ def main(args):
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+                # Brian: do we add noise to depth or not? I think no
+                noisy_latents = torch.cat([noisy_latents, batch["depth_values"]], dim=1)
+
                 # Get the text embedding for conditioning
-                with text_enc_context:
-                    if not args.not_cache_latents:
-                        if args.train_text_encoder:
-                            encoder_hidden_states = text_encoder(batch[0][1])[0]
-                        else:
-                            encoder_hidden_states = batch[0][1]
-                    else:
-                        encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 if args.with_prior_preservation:
-                    # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
-                    noise_pred, noise_pred_prior = torch.chunk(noise_pred, 2, dim=0)
-                    noise, noise_prior = torch.chunk(noise, 2, dim=0)
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
 
                     # Compute instance loss
-                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none").mean([1, 2, 3]).mean()
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none").mean([1, 2, 3]).mean()
 
                     # Compute prior loss
-                    prior_loss = F.mse_loss(noise_pred_prior.float(), noise_prior.float(), reduction="mean")
+                    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
-                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
-                # if accelerator.sync_gradients:
-                #     params_to_clip = (
-                #         itertools.chain(unet.parameters(), text_encoder.parameters())
-                #         if args.train_text_encoder
-                #         else unet.parameters()
-                #     )
-                #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                loss_avg.update(loss.detach_(), bsz)
+                optimizer.zero_grad()
 
-            if not global_step % args.log_interval:
-                logs = {"loss": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=global_step)
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
 
-            if global_step > 0 and not global_step % args.save_interval and global_step >= args.save_min_steps:
-                save_weights(global_step)
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
 
-            progress_bar.update(1)
-            global_step += 1
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
 
         accelerator.wait_for_everyone()
 
-    save_weights(global_step)
+    # Create the pipeline using using the trained modules and save it.
+    if accelerator.is_main_process:
+        pipeline = DiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            unet=accelerator.unwrap_model(unet),
+            text_encoder=accelerator.unwrap_model(text_encoder),
+            revision=args.revision,
+        )
+        pipeline.save_pretrained(args.output_dir)
+
+        if args.push_to_hub:
+            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
 
